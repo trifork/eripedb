@@ -1,0 +1,12 @@
+{application, eripedb,
+ [
+  {description, "Ripe Network database"},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { eripedb_app, []}},
+  {env, []}
+ ]}.

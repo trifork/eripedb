@@ -1,0 +1,6 @@
+/ebin
+*.beam
+*.dump
+*.log
+*~
+*.bak*
