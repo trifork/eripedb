@@ -1,6 +1,10 @@
 /ebin
+/.rebar
 *.beam
 *.dump
 *.log
 *~
 *.bak*
+
+# Data files:
+*.gz

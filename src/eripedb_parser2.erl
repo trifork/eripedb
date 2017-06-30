@@ -9,7 +9,7 @@
 -export([]).
 
 -type address_prefix() :: {Address::binary(), Bits::0..128}.
--type object_callback(X) :: fun((Class:: route|route6, Prefix::address_prefix(), Origin::binary()|undefined, X) -> X).
+-type object_callback(X) :: fun((Name:: {ipv4|ipv6, Prefix::address_prefix()}, Origin::binary()|undefined, X) -> X).
 
 -define(BUFFER_SIZE, (1 bsl 15)). % 32KB
 
@@ -22,7 +22,7 @@
          }).
 
 -spec read/3 :: (iodata(), object_callback(FoldState), FoldState) -> {ok,FoldState} | {error,_}.
-read(FileName, ObjectCallbackFun, FoldState) when is_function(ObjectCallbackFun, 4) ->
+read(FileName, ObjectCallbackFun, FoldState) when is_function(ObjectCallbackFun, 3) ->
     case file:open(FileName, [binary, read, compressed]) of
         {error,_}=Err ->
             Err;
@@ -45,7 +45,7 @@ read(FileName, ObjectCallbackFun, FoldState) when is_function(ObjectCallbackFun,
 %% High level: Read large chunks, splitting at newlines;
 %% Next level: Find "^origin:" | "^route:" | "^route6:"
 
-%% State machine states: none --{has_header,Class,Name}--> |header| --reported--> skipping --separator--> none.
+%% State machine states: none --{has_header,Name}--> |header| --reported--> skipping --separator--> none.
 
 read_loop(State, FoldState) ->
     read_lines(State, <<>>, 0, none, FoldState).
@@ -76,9 +76,9 @@ read_lines(State, Buffer, Pos, SMState, FoldState) ->
 
 handle_line1(State, Line, SMState, FoldState) ->
     case handle_line(Line, SMState) of
-        {report, Class, Name, Origin, NewSMState} ->
+        {report, Name, Origin, NewSMState} ->
             Callback=State#pstate.callback,
-            Foldstate2 = Callback(Class, Name, Origin, FoldState),
+            Foldstate2 = Callback(Name, Origin, FoldState),
             {NewSMState, Foldstate2};
         SMState2 ->
             {SMState2, FoldState}
@@ -88,20 +88,20 @@ handle_line(<<"#", _/binary>>, SMState) ->
     %% Comment - ignore.
     SMState;
 handle_line(<<"route:", PrefixStr/binary>>, none) ->
-    Prefix = parse_address_prefix4(PrefixStr),
-    {has_header, route, Prefix};
+    {IP,PrefixLength} = parse_address_prefix4(PrefixStr),
+    {has_header, {ipv4, IP, PrefixLength}};
 handle_line(<<"route6:", PrefixStr/binary>>, none) ->
-    Prefix = parse_address_prefix6(PrefixStr),
-    {has_header, route6, Prefix};
-handle_line(<<"origin:", Origin0/binary>>, {has_header, Class, Name}) ->
+    {IP,PrefixLength} = parse_address_prefix6(PrefixStr),
+    {has_header, {ipv6, IP, PrefixLength}};
+handle_line(<<"origin:", Origin0/binary>>, {has_header, Name}) ->
     Origin = trim_leading_spaces(Origin0),
     %% Report!
     %% io:format("DB| ~p\n", [{Class, Name, Origin}]),
-    {report, Class, Name, Origin, skipping};
-handle_line(<<"">>, {has_header, Class, Name}) ->
+    {report, Name, Origin, skipping};
+handle_line(<<"">>, {has_header, Name}) ->
     %% Report with origin=undefined!
     %% %% io:format("DB| ~p\n", [{Class, Name, undefined}]),
-    {report, Class, Name, undefined, none};
+    {report, Name, undefined, none};
 handle_line(<<"">>, _) ->
     none;
 handle_line(Line, SMState) ->
@@ -116,30 +116,17 @@ handle_line(Line, SMState) ->
     end,
     SMState.
 
-
-object_name([{<<"route">>, PrefixStr} | _]) ->
-    {route, parse_address_prefix4(PrefixStr)};
-object_name([{<<"route6">>, PrefixStr} | _]) ->
-    {route6, parse_address_prefix6(PrefixStr)};
-object_name([_ | _]) ->
-    unknown_class.
-
-%%% object_field(): Only return first matching attribute.
-object_field(Name, Attrs) ->
-    lists:keyfind(Name, 1, Attrs).
-
-
 parse_address_prefix4(PrefixStr) ->
     [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
     {ok, {A,B,C,D}} = inet:parse_ipv4_address(binary_to_list(IPStr)),
     Length = binary_to_integer(LengthStr),
-    {ipv4, <<A,B,C,D>>, Length}.
+    {<<A,B,C,D>>, Length}.
 
 parse_address_prefix6(PrefixStr) ->
     [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
     {ok, {A,B,C,D,E,F,G,H}} = inet:parse_ipv6_address(binary_to_list(IPStr)),
     Length = binary_to_integer(LengthStr),
-    {ipv6, <<A,B,C,D,E,F,G,H>>, Length}.
+    {<<A,B,C,D,E,F,G,H>>, Length}.
 
 trim_leading_spaces(<<" ", Rest/binary>>) ->
     trim_leading_spaces(Rest);
