@@ -36,7 +36,7 @@ read(FileName, ObjectCallbackFun, FoldState) when is_function(ObjectCallbackFun,
                             newline_cp = binary:compile_pattern(<<"\n">>)
                             },
             try
-                read_loop(State)
+                read_loop(State, FoldState)
             after
                 file:close(File)
             end
@@ -47,50 +47,64 @@ read(FileName, ObjectCallbackFun, FoldState) when is_function(ObjectCallbackFun,
 
 %% State machine states: none --{has_header,Class,Name}--> |header| --reported--> skipping --separator--> none.
 
-read_loop(State) ->
-    read_lines(State, <<>>, 0, none).
+read_loop(State, FoldState) ->
+    read_lines(State, <<>>, 0, none, FoldState).
 
-read_lines(State, Buffer, Pos, SMState) ->
+read_lines(State, Buffer, Pos, SMState, FoldState) ->
     Len = byte_size(Buffer) - Pos,
     case binary:match(Buffer, State#pstate.newline_cp, [{scope,{Pos,Len}}]) of
         nomatch ->
             %% Read some more.
-            case file:read_line(State#pstate.file) of
+            case file:read(State#pstate.file, ?BUFFER_SIZE) of
                 {error, _}=Err ->
                     Err;
                 eof ->
                     <<_:Pos/binary, Line/binary>> = Buffer,
-                    SMState2 = handle_line(State, Line, SMState),
-                    SMState3 = handle_line(State, <<>>, SMState2),
-                    SMState3;
+                    {SMState2, FS2} = handle_line1(State, Line, SMState, FoldState),
+                    {_SMState3, FS3} = handle_line1(State, <<>>, SMState2, FS2),
+                    {ok, FS3};
                 {ok, Data} ->
                     <<_:Pos/binary, Remaining/binary>> = Buffer,
-                    read_lines(State, <<Remaining/binary, Data/binary>>, 0, SMState)
+                    read_lines(State, <<Remaining/binary, Data/binary>>, 0, SMState, FoldState)
             end;
         {NewlinePos,_} ->
-            <<_:Pos/binary, Line:NewlinePos/binary, _/binary>> = Buffer,
-            SMState2 = handle_line(State, Line, SMState),
-            read_lines(State, Buffer, NewlinePos+1, SMState2)
+            LineLen = (NewlinePos-Pos),
+            <<_:Pos/binary, Line:LineLen/binary, _/binary>> = Buffer,
+            {SMState2,FS2} = handle_line1(State, Line, SMState, FoldState),
+            read_lines(State, Buffer, NewlinePos+1, SMState2, FS2)
     end.
 
-handle_line(State, <<"#", _/binary>>, SMState) ->
+handle_line1(State, Line, SMState, FoldState) ->
+    case handle_line(Line, SMState) of
+        {report, Class, Name, Origin, NewSMState} ->
+            Callback=State#pstate.callback,
+            Foldstate2 = Callback(Class, Name, Origin, FoldState),
+            {NewSMState, Foldstate2};
+        SMState2 ->
+            {SMState2, FoldState}
+    end.
+
+handle_line(<<"#", _/binary>>, SMState) ->
     %% Comment - ignore.
     SMState;
-handle_line(State, <<"route:", Name/binary>>, none) ->
-    {has_header, route, Name};
-handle_line(State, <<"route6:", Name/binary>>, none) ->
-    {has_header, route6, Name};
-handle_line(State, <<"origin:", Origin/binary>>, {has_header, Class, Name}) ->
+handle_line(<<"route:", PrefixStr/binary>>, none) ->
+    Prefix = parse_address_prefix4(PrefixStr),
+    {has_header, route, Prefix};
+handle_line(<<"route6:", PrefixStr/binary>>, none) ->
+    Prefix = parse_address_prefix6(PrefixStr),
+    {has_header, route6, Prefix};
+handle_line(<<"origin:", Origin0/binary>>, {has_header, Class, Name}) ->
+    Origin = trim_leading_spaces(Origin0),
     %% Report!
     %% io:format("DB| ~p\n", [{Class, Name, Origin}]),
-    skipping;
-handle_line(State, <<"">>, {has_header, Class, Name}) ->
+    {report, Class, Name, Origin, skipping};
+handle_line(<<"">>, {has_header, Class, Name}) ->
     %% Report with origin=undefined!
     %% %% io:format("DB| ~p\n", [{Class, Name, undefined}]),
+    {report, Class, Name, undefined, none};
+handle_line(<<"">>, _) ->
     none;
-handle_line(State, <<"">>, _) ->
-    none;
-handle_line(State, Line, SMState) ->
+handle_line(Line, SMState) ->
     case SMState of
         none ->
             %% Unexpected class.
@@ -116,7 +130,20 @@ object_field(Name, Attrs) ->
 
 
 parse_address_prefix4(PrefixStr) ->
-    {'TODO', PrefixStr}.
+    [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
+    {ok, {A,B,C,D}} = inet:parse_ipv4_address(binary_to_list(IPStr)),
+    Length = binary_to_integer(LengthStr),
+    {ipv4, <<A,B,C,D>>, Length}.
 
 parse_address_prefix6(PrefixStr) ->
-    {'TODO', PrefixStr}.
+    [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
+    {ok, {A,B,C,D,E,F,G,H}} = inet:parse_ipv6_address(binary_to_list(IPStr)),
+    Length = binary_to_integer(LengthStr),
+    {ipv6, <<A,B,C,D,E,F,G,H>>, Length}.
+
+trim_leading_spaces(<<" ", Rest/binary>>) ->
+    trim_leading_spaces(Rest);
+trim_leading_spaces(<<"\t", Rest/binary>>) ->
+    trim_leading_spaces(Rest);
+trim_leading_spaces(Bin) ->
+    Bin.
