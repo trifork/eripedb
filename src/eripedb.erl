@@ -32,18 +32,20 @@ lookup(ipv6, {A,B,C,D, E,F,G,H}) ->
     async_lookup_with_sync_fallback(ipv6, <<A,B,C,D, E,F,G,H>>).
 
 sync_lookup(Type, IP) when is_atom(Type), is_binary(IP) ->
-    gen_server:gen_call({local, ?SERVER}, {sync_lookup, Type, IP}).
+    gen_server:call(?SERVER, {sync_lookup, Type, IP}).
 
 reload() ->
-    gen_server:gen_call({local, ?SERVER}, reload, 20*1000).
+    gen_server:call(?SERVER, reload, 20*1000).
 
 %%%===================================================================
 %%% Data structures
 %%%===================================================================
 
 -record(state, {
+          database_file :: string(),
           table :: ets:tid(),
-          populated :: boolean()
+          populated :: boolean(),
+          table_token :: reference()
          }).
 
 %%%===================================================================
@@ -51,10 +53,18 @@ reload() ->
 %%%===================================================================
 
 init({DatabaseFile}) ->
+    self() ! reload,
     {ok, #state{
-            table = ets:new(?TABLE_NAME, [named_table, {keypos,1}]),
-            populated = false
+            database_file = DatabaseFile,
+            table = ets:new(?TABLE_NAME, table_options()),
+            populated = false,
+            table_token = make_ref()
            }}.
+
+table_options() ->
+    [named_table, protected, % Allow access from outside.
+     ordered_set,            % Allow prev()-access for non-keys.
+     {keypos,1}].
 
 handle_call({sync_lookup, Type, IP}, _From, State) ->
     case State of
@@ -64,6 +74,11 @@ handle_call({sync_lookup, Type, IP}, _From, State) ->
             Reply = do_lookup(Type, IP)
         end,
     {reply, Reply, State};
+handle_call(reload, From, State) ->
+    start_reload(From, State),
+    {noreply, State};
+handle_call({set_database_file, Filename}, From, State) when is_list(Filename) ->
+    {reply, ok, State#state{database_file=Filename}};
 handle_call(_Request, _From, State) ->
     %% TODO: Log.
 %    {reply, Reply, State}.
@@ -72,7 +87,33 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(_Info, State) ->
+handle_info(reload, State) ->
+    start_reload(undefined, State),
+    {noreply, State};
+handle_info({'ETS-TRANSFER', Table, _FromPid, {ripe_table, Token, ReplyTo}},
+            State=#state{table_token=TableToken, table=OldTable}) ->
+    case Token==TableToken of
+        true ->
+            %% Replace the table:
+            ets:delete(OldTable),
+            RenamedTable = ets:rename(Table, ?TABLE_NAME),
+            error_logger:info_msg("eripedb reload: succeeded (~p entries)",
+                                  [ets:info(RenamedTable, size)]),
+            State2 = State#state{table=RenamedTable, populated=true},
+            Response = loaded;
+        false ->
+            error_logger:warn_msg("eripedb: Received a table with the wrong token: ~p vs expected ~p",
+                                  [Token, TableToken]),
+            Response = {error, wrong_token},
+            State2 = State
+    end,
+    case ReplyTo of
+        undefined -> ok;
+        _ -> gen_server:reply(ReplyTo, Response)
+    end,
+    {noreply, State2};
+handle_info(_Message, State) ->
+    %% TODO: Log.
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -101,10 +142,32 @@ do_lookup(Type, IP) when is_atom(Type), is_binary(IP) ->
                 [{_Key, Origin}] ->
                     {ok, Origin};
                 [] ->
-                    {error, inconsistent} % Huh. Unexpected.
+                    {error, inconsistent} % Huh. Unexpected, but can happen in the async case.
             end;
         _ ->
             %% Either '$end_of_table' or something of another class.
             {error, unknown}
     end.
 
+
+start_reload(From, #state{table_token=Token, database_file=DatabaseFile}) ->
+    Me = self(),
+    proc_lib:spawn_link(fun() -> reload(DatabaseFile, Me, Token, From) end).
+
+reload(DatabaseFile, ServerPid, Token, ReplyTo) ->
+    error_logger:info_msg("eripedb: reload started from file ~p", [DatabaseFile]),
+    try ets:new(?TEMP_TABLE_NAME, table_options()) of
+        Table ->
+            Callback = fun(Key,Value,T) ->
+                               ets:insert(T, {Key,Value}),
+                               T
+                       end,
+            error_logger:info_msg("eripedb reload: starting."),
+            eripedb_parser2:read(DatabaseFile, Callback, Table),
+            error_logger:info_msg("eripedb reload: done - entry_count: ~p", [ets:info(Table,size)]),
+            ets:give_away(Table, ServerPid, {ripe_table, Token, ReplyTo})
+    catch
+        _:badarg ->
+            error_logger:info_msg("eripedb reload: table creation failed."),
+            gen_server:reply(ReplyTo, {error, already_loading})
+    end.
