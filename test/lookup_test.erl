@@ -10,7 +10,7 @@ test_data_fixture(Filename, Fun) ->
      fun() ->
              application:start(sasl),
              application:load(eripedb),
-             application:set_env(eripedb, database_files, ["../test/data/"++Filename]),
+             set_filename(Filename),
              application:start(eripedb)
      end,
      fun(_) ->
@@ -22,6 +22,7 @@ simple_lookup_test_() ->
     test_data_fixture("ipv4.db",
                       fun() ->
                               wait_for(fun() -> eripedb:populated() end, 1000),
+
                               ?assertEqual({ok, <<"SUB24">>},
                                            eripedb:lookup(ipv4, {1,2,3,4})),
                               ?assertEqual({ok, <<"SUB24">>},
@@ -63,18 +64,55 @@ simple_lookup_test_() ->
                                             eripedb:lookup(ipv4, {250,252,0,0})),
 
                               %% Look at "SUB24-FIRST" and "SUB24-LAST" - zero and 255 element special cases:
-                              ?assertEqual({ok, <<"SUB12">>},        eripedb:lookup(ipv4, {1,1,255,255})),
+                              ?assertEqual({ok, <<"SUB12">>},       eripedb:lookup(ipv4, {1,1,255,255})),
                               ?assertEqual({ok, <<"SUB24-FIRST">>}, eripedb:lookup(ipv4, {1,2,0,0})),
                               ?assertEqual({ok, <<"SUB24-FIRST">>}, eripedb:lookup(ipv4, {1,2,0,255})),
                               ?assertEqual({ok, <<"SUB16">>},       eripedb:lookup(ipv4, {1,2,1,0})),
                               ?assertEqual({ok, <<"SUB16">>},       eripedb:lookup(ipv4, {1,2,254,255})),
                               ?assertEqual({ok, <<"SUB24-LAST">>},  eripedb:lookup(ipv4, {1,2,255,0})),
                               ?assertEqual({ok, <<"SUB24-LAST">>},  eripedb:lookup(ipv4, {1,2,255,255})),
-                              ?assertEqual({ok, <<"SUB12">>},        eripedb:lookup(ipv4, {1,3,0,0})),
+                              ?assertEqual({ok, <<"SUB12">>},       eripedb:lookup(ipv4, {1,3,0,0})),
                               ok
                       end).
 
+reload_gap_test_() ->
+    test_data_fixture("ipv4.db",
+                      fun() ->
+                              wait_for(fun() -> eripedb:populated() end, 1000),
+
+                              Me = self(),
+                              proc_lib:spawn_link(fun() -> lookup_N_times(ipv4, {1,2,3,4}, 100, 1, Me) end),
+                              timer:sleep(10),
+                              set_filename("alternative.db"),
+                              eripedb:reload(),
+                              Results = [receive
+                                             {lookup_result, Res} ->
+                                                 Res
+                                         after 100 ->
+                                                 timeout
+                                         end || _ <- lists:seq(1,100)],
+                              ?assertEqual(100, length(Results)),
+                              %io:format(user, "DB| reload_gap_test_:\n => ~p\n", [Results]),
+                              ?assertEqual([{ok,<<"ALT24">>}, {ok,<<"SUB24">>}], % We get both "before" and "after" results, but no errors.
+                                           lists:usort(Results))
+                      end).
+
+lookup_N_times(Class, IP, Iters, Delay, Destination) ->
+    if Iters > 0 ->
+            Res = eripedb:lookup(Class, IP),
+            Destination ! {lookup_result, Res},
+            timer:sleep(Delay),
+            lookup_N_times(Class, IP, Iters-1, Delay, Destination);
+       true ->
+            ok
+    end.
+
+
 %%%========== Utility: ========================================
+
+set_filename(Filename) ->
+    application:set_env(eripedb, database_files, ["../test/data/"++Filename]).
+
 
 wait_for(Fun, TimeoutMillis) ->
     T0 = erlang:monotonic_time(1000),

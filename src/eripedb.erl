@@ -70,6 +70,13 @@ populated() ->
 %%% gen_server callbacks
 %%%===================================================================
 
+
+-ifdef(TEST).
+-define(delay_if_under_test(Amount), timer:sleep(Amount)).
+-else.
+-define(delay_if_under_test(_), ok).
+-endif.
+
 init({}) ->
     self() ! reload,
     %process_flag(trap_exit, false), % Be able to link to sub processes
@@ -108,12 +115,6 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
--ifdef(TEST).
--define(delay_if_under_test(), timer:sleep(100)).
--else.
--define(delay_if_under_test(), ok).
--endif.
-
 handle_info(reload, State) ->
     start_reload(undefined, State),
     {noreply, State};
@@ -123,7 +124,7 @@ handle_info({'ETS-TRANSFER', Table, _FromPid, {ripe_table, Token, ReplyTo, NewDa
         true ->
             %% Replace the table:
             ets:delete(OldTable),
-            ?delay_if_under_test(),               % Expose race condition
+            ?delay_if_under_test(100),         % Expose race condition
             RenamedTable = ets:rename(Table, ?TABLE_NAME),
             error_logger:info_msg("eripedb reload: succeeded (~p entries)",
                                   [ets:info(RenamedTable, size)]),
@@ -218,6 +219,7 @@ database_files_from_config() ->
 reload_process(ServerPid, Token, ReplyTo) ->
     try
         DatabaseFiles = database_files_from_config(),
+        ?delay_if_under_test(50),           % Expose loading state
         reload(DatabaseFiles, ServerPid, Token, ReplyTo)
     catch Cls:Err ->
             error_logger:error_msg("Reload failed: ~p:~p\n** Trace: ~p\n",
