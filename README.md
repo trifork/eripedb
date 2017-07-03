@@ -1,18 +1,22 @@
-Erlang implementation of IP to ASN database
-===========================================
+`eripedb` &mdash; Erlang implementation of IP to ASN database
+=============================================================
 
 This library maps IP addresses to ASN identifiers,
 based on the RIPE database.
 
 Both IPv4 and IPv6 addresses are supported.
-The latest version of the database (which the library needs)
-can be downloaded from:
 
-  ftp://ftp.ripe.net/ripe/dbase/split/ripe.db.route.gz
-  ftp://ftp.ripe.net/ripe/dbase/split/ripe.db.route6.gz
+The library does not include the actual database.
+The latest version of the database can be downloaded from these locations:
+
+  <ftp://ftp.ripe.net/ripe/dbase/split/ripe.db.route.gz>
+
+  <ftp://ftp.ripe.net/ripe/dbase/split/ripe.db.route6.gz>
 
 The library can use these files in their compressed states;
 you do not need to uncompress them.
+(Although you may if you wish; both compressed and uncompressed
+database files are supported.)
 
 Example use:
 
@@ -21,4 +25,7 @@ Example use:
 
 Example configuration:
 
-    TODO
+    {eripedb,
+     [{database_files, ["ripe.db.route.gz",
+                        "ripe.db.route6.gz"]}
+     ]}

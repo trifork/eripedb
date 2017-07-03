@@ -1,8 +1,8 @@
--module(eripedb_parser2).
+-module(eripedb_parser).
 
 %%% **********************************************************************
-%%% * PURPOSE: Ripe Network database, for looking up ISP info given an   *
-%%% * IP address.                                                        *
+%%% * PURPOSE: Parsing a RIPE database file ("route" or "route6"),       *
+%%% * possibly compressed.                                               *
 %%% **********************************************************************
 
 -compile(export_all). % TODO

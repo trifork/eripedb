@@ -20,7 +20,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/1,
+-export([start_link/0,
          lookup/2,
          sync_lookup/2,
          reload/0]).
@@ -37,8 +37,8 @@
 %%% API
 %%%===================================================================
 
-start_link(DatabaseFile) ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, {DatabaseFile}, []).
+start_link() ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, {}, []).
 
 lookup(ipv4, {A,B,C,D}) ->
     async_lookup_with_sync_fallback(ipv4, <<A,B,C,D>>);
@@ -56,7 +56,7 @@ reload() ->
 %%%===================================================================
 
 -record(state, {
-          database_file :: string(),
+          database_files :: string(),
           table :: ets:tid(),
           populated :: boolean(),
           table_token :: reference()
@@ -66,10 +66,10 @@ reload() ->
 %%% gen_server callbacks
 %%%===================================================================
 
-init({DatabaseFile}) ->
+init({}) ->
     self() ! reload,
     {ok, #state{
-            database_file = DatabaseFile,
+            database_files = [],
             table = ets:new(?TABLE_NAME, table_options()),
             populated = false,
             table_token = make_ref()
@@ -91,8 +91,8 @@ handle_call({sync_lookup, Type, IP}, _From, State) ->
 handle_call(reload, From, State) ->
     start_reload(From, State),
     {noreply, State};
-handle_call({set_database_file, Filename}, From, State) when is_list(Filename) ->
-    {reply, ok, State#state{database_file=Filename}};
+handle_call({set_database_files, Filename}, _From, State) when is_list(Filename) ->
+    {reply, ok, State#state{database_files=Filename}};
 handle_call(_Request, _From, State) ->
     %% TODO: Log.
 %    {reply, Reply, State}.
@@ -104,7 +104,7 @@ handle_cast(_Msg, State) ->
 handle_info(reload, State) ->
     start_reload(undefined, State),
     {noreply, State};
-handle_info({'ETS-TRANSFER', Table, _FromPid, {ripe_table, Token, ReplyTo}},
+handle_info({'ETS-TRANSFER', Table, _FromPid, {ripe_table, Token, ReplyTo, NewDatabaseFiles}},
             State=#state{table_token=TableToken, table=OldTable}) ->
     case Token==TableToken of
         true ->
@@ -113,11 +113,15 @@ handle_info({'ETS-TRANSFER', Table, _FromPid, {ripe_table, Token, ReplyTo}},
             RenamedTable = ets:rename(Table, ?TABLE_NAME),
             error_logger:info_msg("eripedb reload: succeeded (~p entries)",
                                   [ets:info(RenamedTable, size)]),
-            State2 = State#state{table=RenamedTable, populated=true},
+            State2 = State#state{
+                       table=RenamedTable,
+                       populated=true,
+                       database_files=NewDatabaseFiles
+                      },
             Response = loaded;
         false ->
-            error_logger:warn_msg("eripedb: Received a table with the wrong token: ~p vs expected ~p",
-                                  [Token, TableToken]),
+            error_logger:error_msg("eripedb: Received a table with the wrong token: ~p vs expected ~p",
+                                   [Token, TableToken]),
             Response = {error, wrong_token},
             State2 = State
     end,
@@ -165,22 +169,41 @@ do_lookup(Type, IP) when is_atom(Type), is_binary(IP) ->
     end.
 
 
-start_reload(From, #state{table_token=Token, database_file=DatabaseFile}) ->
+start_reload(From, #state{table_token=Token}) ->
     Me = self(),
-    proc_lib:spawn_link(fun() -> reload(DatabaseFile, Me, Token, From) end).
+    proc_lib:spawn_link(fun() ->
+                                DatabaseFiles = database_files_from_config(),
+                                reload(DatabaseFiles, Me, Token, From)
+                        end).
 
-reload(DatabaseFile, ServerPid, Token, ReplyTo) ->
-    error_logger:info_msg("eripedb: reload started from file ~p", [DatabaseFile]),
+database_files_from_config() ->
+    case application:get_env(eripedb, database_files) of
+        undefined ->
+            error_logger:error_msg("eripedb: No database_files have been configured."),
+            DatabaseFiles = [];
+        {ok, DatabaseFiles} ->
+            ok
+    end,
+    DatabaseFiles.
+
+reload(DatabaseFiles, ServerPid, Token, ReplyTo) ->
+    error_logger:info_msg("eripedb: reloading from files ~p", [DatabaseFiles]),
     try ets:new(?TEMP_TABLE_NAME, table_options()) of
         Table ->
             Callback = fun(Key,Value,T) ->
                                ets:insert(T, {Key,Value}),
                                T
                        end,
-            error_logger:info_msg("eripedb reload: starting."),
-            eripedb_parser2:read(DatabaseFile, Callback, Table),
-            error_logger:info_msg("eripedb reload: done - entry_count: ~p", [ets:info(Table,size)]),
-            ets:give_away(Table, ServerPid, {ripe_table, Token, ReplyTo})
+            lists:foreach(fun(DBF) ->
+                                  T0 = erlang:monotonic_time(1000000),
+                                  error_logger:info_msg("eripedb reload: reading ~p...", [DBF]),
+                                  eripedb_parser:read(DBF, Callback, Table),
+                                  T1 = erlang:monotonic_time(1000000),
+                                  error_logger:info_msg("eripedb reload: read ~p in ~Bms", [DBF, round((T1-T0)/1000.0)])
+                         end,
+                         DatabaseFiles),
+            error_logger:info_msg("eripedb reload: done - entry_count=~p", [ets:info(Table,size)]),
+            ets:give_away(Table, ServerPid, {ripe_table, Token, ReplyTo, DatabaseFiles})
     catch
         _:badarg ->
             error_logger:info_msg("eripedb reload: table creation failed."),
