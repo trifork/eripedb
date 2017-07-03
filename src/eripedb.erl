@@ -2,6 +2,20 @@
 %%% **********************************************************************
 %%% * PURPOSE: Server part, for containing state and servicing requests. *
 %%% **********************************************************************
+%%% | Design forces:
+%%% | - Avoiding having a single process be a bottleneck.
+%%% | - Avoiding downtime while a new database is being loaded.
+%%% | - Efficient database lookup.
+%%% | Design:
+%%% | - Keep the database in a protected ETS table, and let other processes
+%%% |   read directly from that table (at least in the common case).
+%%% | - Table is sorted and is structured by {IPClass, IP, PrefixLength} key;
+%%% |   this means that a single ets:prev()-lookup suffices to get to the
+%%% |   relevant entry.
+%%% | - When data is being loaded, it is inserted into another table.
+%%% |   This table is then renamed, after which it is the master table.
+%%% |   The necessary precautions are taken to ensure that lookups still
+%%% |   work during this swapping period.
 
 -behaviour(gen_server).
 
@@ -138,6 +152,7 @@ async_lookup_with_sync_fallback(Type, IP) when is_atom(Type), is_binary(IP) ->
 do_lookup(Type, IP) when is_atom(Type), is_binary(IP) ->
     case ets:prev(?TABLE_NAME, {Type, IP, 1000}) of
         {Type, _, _}=Key ->
+            %% TODO: Add check that IP is in fact within the prefix!
             case ets:lookup(?TABLE_NAME, Key) of
                 [{_Key, Origin}] ->
                     {ok, Origin};
