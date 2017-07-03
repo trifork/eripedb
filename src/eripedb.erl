@@ -10,8 +10,8 @@
 %%% | - Keep the database in a protected ETS table, and let other processes
 %%% |   read directly from that table (at least in the common case).
 %%% | - Table is sorted and is structured by {IPClass, IP, PrefixLength} key;
-%%% |   this means that a single ets:prev()-lookup suffices to get to the
-%%% |   relevant entry.
+%%% |   this means that a single to a few ets:prev()-lookups suffice to
+%%% |   get to the relevant entry.
 %%% | - When data is being loaded, it is inserted into another table.
 %%% |   This table is then renamed, after which it is the master table.
 %%% |   The necessary precautions are taken to ensure that lookups still
@@ -23,7 +23,8 @@
 -export([start_link/0,
          lookup/2,
          sync_lookup/2,
-         reload/0]).
+         reload/0,
+         populated/0]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -51,6 +52,9 @@ sync_lookup(Type, IP) when is_atom(Type), is_binary(IP) ->
 reload() ->
     gen_server:call(?SERVER, reload, 20*1000).
 
+populated() ->
+    gen_server:call(?SERVER, populated).
+
 %%%===================================================================
 %%% Data structures
 %%%===================================================================
@@ -68,6 +72,7 @@ reload() ->
 
 init({}) ->
     self() ! reload,
+    %process_flag(trap_exit, false), % Be able to link to sub processes
     {ok, #state{
             database_files = [],
             table = ets:new(?TABLE_NAME, table_options()),
@@ -91,6 +96,8 @@ handle_call({sync_lookup, Type, IP}, _From, State) ->
 handle_call(reload, From, State) ->
     start_reload(From, State),
     {noreply, State};
+handle_call(populated, _From, State) ->
+    {reply, State#state.populated, State};
 handle_call({set_database_files, Filename}, _From, State) when is_list(Filename) ->
     {reply, ok, State#state{database_files=Filename}};
 handle_call(_Request, _From, State) ->
@@ -101,6 +108,12 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+-ifdef(TEST).
+-define(delay_if_under_test(), timer:sleep(100)).
+-else.
+-define(delay_if_under_test(), ok).
+-endif.
+
 handle_info(reload, State) ->
     start_reload(undefined, State),
     {noreply, State};
@@ -110,6 +123,7 @@ handle_info({'ETS-TRANSFER', Table, _FromPid, {ripe_table, Token, ReplyTo, NewDa
         true ->
             %% Replace the table:
             ets:delete(OldTable),
+            ?delay_if_under_test(),               % Expose race condition
             RenamedTable = ets:rename(Table, ?TABLE_NAME),
             error_logger:info_msg("eripedb reload: succeeded (~p entries)",
                                   [ets:info(RenamedTable, size)]),
@@ -153,15 +167,23 @@ async_lookup_with_sync_fallback(Type, IP) when is_atom(Type), is_binary(IP) ->
             sync_lookup(Type, IP)
     end.
 
-do_lookup(Type, IP) when is_atom(Type), is_binary(IP) ->
-    case ets:prev(?TABLE_NAME, {Type, IP, 1000}) of
+do_lookup(Type, IP) when is_atom(Type), is_bitstring(IP) ->
+    case ets:prev(?TABLE_NAME, {Type, IP, 1}) of
         {Type, _, _}=Key ->
             %% TODO: Add check that IP is in fact within the prefix!
             case ets:lookup(?TABLE_NAME, Key) of
-                [{_Key, Origin}] ->
-                    {ok, Origin};
+                [{{_Type, Prefix, _Dummy}, Origin}] ->
+                    PrefixLen = bit_size(Prefix),
+                    case IP of
+                        <<Prefix:PrefixLen/bitstring, _/bitstring>> ->
+                            %% Prefix matches!
+                            {ok, Origin};
+                        _ ->
+                            %% Prefix does not match. Recurse, trying to hit parent:
+                            do_lookup(Type, longest_common_bitstring(IP, Prefix))
+                    end;
                 [] ->
-                    {error, inconsistent} % Huh. Unexpected, but can happen in the async case.
+                    {error, inconsistent} % Slightly unexpected, but can happen in the async case.
             end;
         _ ->
             %% Either '$end_of_table' or something of another class.
@@ -169,12 +191,19 @@ do_lookup(Type, IP) when is_atom(Type), is_binary(IP) ->
     end.
 
 
-start_reload(From, #state{table_token=Token}) ->
+start_reload(ReplyTo, #state{table_token=Token}) ->
     Me = self(),
-    proc_lib:spawn_link(fun() ->
-                                DatabaseFiles = database_files_from_config(),
-                                reload(DatabaseFiles, Me, Token, From)
-                        end).
+    supervisor:start_child(eripedb_sup,
+                           {eripedb_loader,
+                            {erlang, apply, [fun reload_process/3, [Me, Token, ReplyTo]]},
+                            temporary,
+                            100,
+                            worker,
+                            [?MODULE, eripedb_parser]}).
+    %% proc_lib:spawn_link(fun() ->
+    %%                             DatabaseFiles = database_files_from_config(),
+    %%                             reload(DatabaseFiles, Me, Token, ReplyTo)
+    %%                     end).
 
 database_files_from_config() ->
     case application:get_env(eripedb, database_files) of
@@ -185,6 +214,18 @@ database_files_from_config() ->
             ok
     end,
     DatabaseFiles.
+
+reload_process(ServerPid, Token, ReplyTo) ->
+    try
+        DatabaseFiles = database_files_from_config(),
+        reload(DatabaseFiles, ServerPid, Token, ReplyTo)
+    catch Cls:Err ->
+            error_logger:error_msg("Reload failed: ~p:~p\n** Trace: ~p\n",
+                                   [Cls, Err, Trace=erlang:get_stacktrace()]),
+            erlang:raise(Cls, Err, Trace)       % Let crash.
+    end.
+
+
 
 reload(DatabaseFiles, ServerPid, Token, ReplyTo) ->
     error_logger:info_msg("eripedb: reloading from files ~p", [DatabaseFiles]),
@@ -197,7 +238,13 @@ reload(DatabaseFiles, ServerPid, Token, ReplyTo) ->
             lists:foreach(fun(DBF) ->
                                   T0 = erlang:monotonic_time(1000000),
                                   error_logger:info_msg("eripedb reload: reading ~p...", [DBF]),
-                                  eripedb_parser:read(DBF, Callback, Table),
+                                  case eripedb_parser:read(DBF, Callback, Table) of
+                                      {ok, _} ->
+                                          ok;
+                                      {error, Reason} ->
+                                          error_logger:error_msg("eripedb reload: reading ~p failed: ~p", [DBF, Reason]),
+                                          error({failed_to_read_file, DBF, Reason})
+                                  end,
                                   T1 = erlang:monotonic_time(1000000),
                                   error_logger:info_msg("eripedb reload: read ~p in ~Bms", [DBF, round((T1-T0)/1000.0)])
                          end,
@@ -209,3 +256,28 @@ reload(DatabaseFiles, ServerPid, Token, ReplyTo) ->
             error_logger:info_msg("eripedb reload: table creation failed."),
             gen_server:reply(ReplyTo, {error, already_loading})
     end.
+
+longest_common_bitstring(A, B) ->
+    longest_common_bitstring_by_bytes(A, B, 0).
+
+longest_common_bitstring_by_bytes(A, B, Len) ->
+    LenP1 = Len+1,
+    case {A,B} of
+        {<<X:LenP1/binary, _/bitstring>>,
+         <<X:LenP1/binary, _/bitstring>>} ->
+            longest_common_bitstring_by_bytes(A, B, Len+1);
+        _ ->
+            longest_common_bitstring_by_bits(A, B, 8*Len)
+    end.
+
+longest_common_bitstring_by_bits(A, B, Len) ->
+    LenP1 = Len+1,
+    case {A,B} of
+        {<<X:LenP1/bitstring, _/bitstring>>,
+         <<X:LenP1/bitstring, _/bitstring>>} ->
+            longest_common_bitstring_by_bits(A, B, Len+1);
+        _ ->
+            <<Common:Len/bitstring, _/bitstring>> = A,
+            Common
+    end.
+

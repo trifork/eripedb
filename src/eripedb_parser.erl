@@ -88,19 +88,17 @@ handle_line(<<"#", _/binary>>, SMState) ->
     %% Comment - ignore.
     SMState;
 handle_line(<<"route:", PrefixStr/binary>>, none) ->
-    {IP,PrefixLength} = parse_address_prefix4(PrefixStr),
-    {has_header, {ipv4, IP, PrefixLength}};
+    Prefix = parse_address_prefix4(PrefixStr),
+    {has_header, {ipv4, Prefix, 0}};
 handle_line(<<"route6:", PrefixStr/binary>>, none) ->
-    {IP,PrefixLength} = parse_address_prefix6(PrefixStr),
-    {has_header, {ipv6, IP, PrefixLength}};
+    Prefix = parse_address_prefix6(PrefixStr),
+    {has_header, {ipv6, Prefix, 0}};
 handle_line(<<"origin:", Origin0/binary>>, {has_header, Name}) ->
     Origin = trim_leading_spaces(Origin0),
-    %% Report!
-    %% io:format("DB| ~p\n", [{Class, Name, Origin}]),
+    %% Report:
     {report, Name, Origin, skipping};
 handle_line(<<"">>, {has_header, Name}) ->
-    %% Report with origin=undefined!
-    %% %% io:format("DB| ~p\n", [{Class, Name, undefined}]),
+    %% Report with origin=undefined:
     {report, Name, undefined, none};
 handle_line(<<"">>, _) ->
     none;
@@ -108,7 +106,7 @@ handle_line(Line, SMState) ->
     case SMState of
         none ->
             %% Unexpected class.
-            io:format("Unexpected object header: ~p\n", [Line]),
+            error_logger:warning_msg("Unexpected object header: ~p\n", [Line]),
             skipping;
         _ ->
             %% Other field. Ignore.
@@ -120,13 +118,15 @@ parse_address_prefix4(PrefixStr) ->
     [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
     {ok, {A,B,C,D}} = inet:parse_ipv4_address(binary_to_list(IPStr)),
     Length = binary_to_integer(LengthStr),
-    {<<A,B,C,D>>, Length}.
+    <<Prefix:Length/bitstring, _/bitstring>> = <<A,B,C,D>>,
+    Prefix.
 
 parse_address_prefix6(PrefixStr) ->
     [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
     {ok, {A,B,C,D,E,F,G,H}} = inet:parse_ipv6_address(binary_to_list(IPStr)),
     Length = binary_to_integer(LengthStr),
-    {<<A,B,C,D,E,F,G,H>>, Length}.
+    <<Prefix:Length/bitstring, _/bitstring>> = <<A,B,C,D,E,F,G,H>>,
+    Prefix.
 
 trim_leading_spaces(<<" ", Rest/binary>>) ->
     trim_leading_spaces(Rest);

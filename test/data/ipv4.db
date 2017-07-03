@@ -1,0 +1,15 @@
+route: 1.0.0.0/8
+origin: SUB8
+
+route: 1.2.0.0/16
+origin: SUB16
+
+route: 1.2.3.0/24
+origin: SUB24
+
+route: 1.0.0.0/12
+origin: SUB12
+
+route: 250.251.0.0/16
+origin: BUS16
+

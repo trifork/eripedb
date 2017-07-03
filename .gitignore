@@ -1,5 +1,6 @@
 /ebin
 /.rebar
+/.eunit
 *.beam
 *.dump
 *.log
