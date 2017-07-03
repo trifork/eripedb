@@ -13,3 +13,9 @@ origin: SUB12
 route: 250.251.0.0/16
 origin: BUS16
 
+route: 1.2.0.0/24
+origin: SUB24-FIRST
+
+route: 1.2.255.0/24
+origin: SUB24-LAST
+

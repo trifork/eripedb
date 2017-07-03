@@ -61,6 +61,16 @@ simple_lookup_test_() ->
                                             eripedb:lookup(ipv4, {250,251,255,255})),
                               ?assertEqual({error, unknown},
                                             eripedb:lookup(ipv4, {250,252,0,0})),
+
+                              %% Look at "SUB24-FIRST" and "SUB24-LAST" - zero and 255 element special cases:
+                              ?assertEqual({ok, <<"SUB12">>},        eripedb:lookup(ipv4, {1,1,255,255})),
+                              ?assertEqual({ok, <<"SUB24-FIRST">>}, eripedb:lookup(ipv4, {1,2,0,0})),
+                              ?assertEqual({ok, <<"SUB24-FIRST">>}, eripedb:lookup(ipv4, {1,2,0,255})),
+                              ?assertEqual({ok, <<"SUB16">>},       eripedb:lookup(ipv4, {1,2,1,0})),
+                              ?assertEqual({ok, <<"SUB16">>},       eripedb:lookup(ipv4, {1,2,254,255})),
+                              ?assertEqual({ok, <<"SUB24-LAST">>},  eripedb:lookup(ipv4, {1,2,255,0})),
+                              ?assertEqual({ok, <<"SUB24-LAST">>},  eripedb:lookup(ipv4, {1,2,255,255})),
+                              ?assertEqual({ok, <<"SUB12">>},        eripedb:lookup(ipv4, {1,3,0,0})),
                               ok
                       end).
 
