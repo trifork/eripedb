@@ -1,4 +1,4 @@
--module(eripedb_parser).
+-module(eripedb_parser2).
 
 %%% **********************************************************************
 %%% * PURPOSE: Ripe Network database, for looking up ISP info given an   *
@@ -9,19 +9,20 @@
 -export([]).
 
 -type address_prefix() :: {Address::binary(), Bits::0..128}.
--type object_callback(X) :: fun((Class:: route|route6, Prefix::address_prefix(), Origin::binary()|undefined, X) -> X).
+-type object_callback(X) :: fun((Name:: {ipv4|ipv6, Prefix::address_prefix()}, Origin::binary()|undefined, X) -> X).
 
--define(BUFFER_SIZE, 8192).
+-define(BUFFER_SIZE, (1 bsl 15)). % 32KB
 
 -record(pstate, {
           callback :: object_callback(_),
           file :: file:iodevice(),
           line_re :: re:mp(),
-          extension_re :: re:mp()
+          extension_re :: re:mp(),
+          newline_cp :: binary:cp()
          }).
 
 -spec read/3 :: (iodata(), object_callback(FoldState), FoldState) -> {ok,FoldState} | {error,_}.
-read(FileName, ObjectCallbackFun, InitFoldState) when is_function(ObjectCallbackFun, 4) ->
+read(FileName, ObjectCallbackFun, FoldState) when is_function(ObjectCallbackFun, 3) ->
     case file:open(FileName, [binary, read, compressed]) of
         {error,_}=Err ->
             Err;
@@ -31,111 +32,105 @@ read(FileName, ObjectCallbackFun, InitFoldState) when is_function(ObjectCallback
             State = #pstate{callback=ObjectCallbackFun,
                             file=File,
                             line_re=LineRE,
-                            extension_re=ExtensionRE
+                            extension_re=ExtensionRE,
+                            newline_cp = binary:compile_pattern(<<"\n">>)
                             },
             try
-                read_loop(State, InitFoldState)
+                read_loop(State, FoldState)
             after
                 file:close(File)
             end
     end.
 
+%% High level: Read large chunks, splitting at newlines;
+%% Next level: Find "^origin:" | "^route:" | "^route6:"
+
+%% State machine states: none --{has_header,Name}--> |header| --reported--> skipping --separator--> none.
+
 read_loop(State, FoldState) ->
-    case read_object(State) of
-        {ok, Attrs} ->
-            case object_name(Attrs) of
-                unknown_class ->
-                    FoldState2 = FoldState,
-                    ok; % Ignore
-                {Class, Prefix} ->
-                    ObjectCallbackFun = State#pstate.callback,
-                    case object_field(<<"origin">>, tl(Attrs)) of
-                        {_, Origin} ->
-                            ok;
-                        false ->
-                            Origin=undefined
-                    end,
-                    FoldState2 = ObjectCallbackFun(Class, Prefix, Origin, FoldState)
-            end,
-            read_loop(State, FoldState2);
-        eof ->
-            FoldState
+    read_lines(State, <<>>, 0, none, FoldState).
+
+read_lines(State, Buffer, Pos, SMState, FoldState) ->
+    Len = byte_size(Buffer) - Pos,
+    case binary:match(Buffer, State#pstate.newline_cp, [{scope,{Pos,Len}}]) of
+        nomatch ->
+            %% Read some more.
+            case file:read(State#pstate.file, ?BUFFER_SIZE) of
+                {error, _}=Err ->
+                    Err;
+                eof ->
+                    <<_:Pos/binary, Line/binary>> = Buffer,
+                    {SMState2, FS2} = handle_line1(State, Line, SMState, FoldState),
+                    {_SMState3, FS3} = handle_line1(State, <<>>, SMState2, FS2),
+                    {ok, FS3};
+                {ok, Data} ->
+                    <<_:Pos/binary, Remaining/binary>> = Buffer,
+                    read_lines(State, <<Remaining/binary, Data/binary>>, 0, SMState, FoldState)
+            end;
+        {NewlinePos,_} ->
+            LineLen = (NewlinePos-Pos),
+            <<_:Pos/binary, Line:LineLen/binary, _/binary>> = Buffer,
+            {SMState2,FS2} = handle_line1(State, Line, SMState, FoldState),
+            read_lines(State, Buffer, NewlinePos+1, SMState2, FS2)
     end.
 
-object_name([{<<"route">>, PrefixStr} | _]) ->
-    {route, parse_address_prefix4(PrefixStr)};
-object_name([{<<"route6">>, PrefixStr} | _]) ->
-    {route6, parse_address_prefix6(PrefixStr)};
-object_name([_ | _]) ->
-    unknown_class.
+handle_line1(State, Line, SMState, FoldState) ->
+    case handle_line(Line, SMState) of
+        {report, Name, Origin, NewSMState} ->
+            Callback=State#pstate.callback,
+            Foldstate2 = Callback(Name, Origin, FoldState),
+            {NewSMState, Foldstate2};
+        SMState2 ->
+            {SMState2, FoldState}
+    end.
 
-%%% object_field(): Only return first matching attribute.
-object_field(Name, Attrs) ->
-    lists:keyfind(Name, 1, Attrs).
-
+handle_line(<<"#", _/binary>>, SMState) ->
+    %% Comment - ignore.
+    SMState;
+handle_line(<<"route:", PrefixStr/binary>>, none) ->
+    {IP,PrefixLength} = parse_address_prefix4(PrefixStr),
+    {has_header, {ipv4, IP, PrefixLength}};
+handle_line(<<"route6:", PrefixStr/binary>>, none) ->
+    {IP,PrefixLength} = parse_address_prefix6(PrefixStr),
+    {has_header, {ipv6, IP, PrefixLength}};
+handle_line(<<"origin:", Origin0/binary>>, {has_header, Name}) ->
+    Origin = trim_leading_spaces(Origin0),
+    %% Report!
+    %% io:format("DB| ~p\n", [{Class, Name, Origin}]),
+    {report, Name, Origin, skipping};
+handle_line(<<"">>, {has_header, Name}) ->
+    %% Report with origin=undefined!
+    %% %% io:format("DB| ~p\n", [{Class, Name, undefined}]),
+    {report, Name, undefined, none};
+handle_line(<<"">>, _) ->
+    none;
+handle_line(Line, SMState) ->
+    case SMState of
+        none ->
+            %% Unexpected class.
+            io:format("Unexpected object header: ~p\n", [Line]),
+            skipping;
+        _ ->
+            %% Other field. Ignore.
+            SMState
+    end,
+    SMState.
 
 parse_address_prefix4(PrefixStr) ->
-    {'TODO', PrefixStr}.
+    [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
+    {ok, {A,B,C,D}} = inet:parse_ipv4_address(binary_to_list(IPStr)),
+    Length = binary_to_integer(LengthStr),
+    {<<A,B,C,D>>, Length}.
 
 parse_address_prefix6(PrefixStr) ->
-    {'TODO', PrefixStr}.
+    [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
+    {ok, {A,B,C,D,E,F,G,H}} = inet:parse_ipv6_address(binary_to_list(IPStr)),
+    Length = binary_to_integer(LengthStr),
+    {<<A,B,C,D,E,F,G,H>>, Length}.
 
-read_object(State) ->
-    read_object(State, []).
-
-read_object(State, Attrs) ->
-    case read_line(State) of
-        {error, _}=Err ->
-            Err;
-        eof when Attrs==[] ->
-            eof;
-        eof ->
-            %% Return the object.
-            {ok, lists:reverse(Attrs)};
-        blank_line when Attrs==[] ->
-            %% Skip leading seperator.
-            read_object(State);
-        blank_line ->
-            %% Return the object.
-            {ok, lists:reverse(Attrs)};
-        {ok, Key, Value} ->
-            %% io:format("DB| Data: ~p\n", [{Key, Value}]),
-            read_object(State, [{Key,Value} | Attrs]);
-        {extension, Ext} ->
-            [{Key, Value} | Rest] = Attrs,
-            Value2 = <<Value/binary, "\n", Ext/binary>>,
-            read_object(State, [{Key, Value2} | Rest])
-    end.
-
-
-read_line(State=#pstate{file=File}) ->
-    case file:read_line(File) of
-        {error, _}=Err ->
-            Err;
-        eof ->
-            eof;
-        {ok, <<"#", _/binary>>} ->
-            %% Comment - ignore
-            read_line(State);
-        {ok, <<"\n">>} ->
-            blank_line;
-        {ok, <<"\r\n">>} ->
-            blank_line;
-        {ok, Line = <<C, _/binary>>} when C==$o; C==$r ->
-            LineRE = State#pstate.line_re,
-            case re:run(Line, LineRE, [{capture, all_but_first, binary}]) of
-                {match, [Attribute,Value]} ->
-                    {ok, Attribute, Value};
-                nomatch ->
-                    %% case re:run(Line, State#pstate.extension_re, [{capture, all_but_first, binary}]) of
-                    %%     {match, [Extension]} ->
-                    %%         {extension, Extension};
-                    %%     nomatch ->
-                            io:format("DB| Bad line: ~p\n", [Line]),
-                            {error, {bad_line, Line}}
-                    %% end
-            end;
-        {ok, _Line} ->
-            %% Ignore other attributes!
-            read_line(State)
-    end.
+trim_leading_spaces(<<" ", Rest/binary>>) ->
+    trim_leading_spaces(Rest);
+trim_leading_spaces(<<"\t", Rest/binary>>) ->
+    trim_leading_spaces(Rest);
+trim_leading_spaces(Bin) ->
+    Bin.
