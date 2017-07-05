@@ -107,6 +107,25 @@ lookup_N_times(Class, IP, Iters, Delay, Destination) ->
             ok
     end.
 
+lookup_speed_test_() ->
+    test_data_fixture("ipv4.db",
+                      fun() ->
+                              F = fun(0,_) -> ok;
+                                     (N,F) ->
+                                          eripedb:lookup(ipv4, {0,0,0,0}),
+                                          eripedb:lookup(ipv4, {1,0,0,0}),
+                                          eripedb:lookup(ipv4, {1,2,0,0}),
+                                          eripedb:lookup(ipv4, {1,2,3,0}),
+                                          eripedb:lookup(ipv4, {1,2,3,4}),
+                                          eripedb:lookup(ipv6, {0,0,0,0,0,0,0,0}),
+                                          F(N-1,F)
+                                  end,
+                              N=10000,
+                              {Time,_} = timer:tc(fun() -> F(N, F) end),
+                              Calls = 6*N,
+                              io:format(user, "Lookup speed: ~.3fus/call; ~.1f calls/s\n", [Time/Calls, Calls/(Time/1.0e6)])
+                      end).
+
 
 %%%========== Utility: ========================================
 

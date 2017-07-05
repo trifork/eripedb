@@ -9,9 +9,11 @@
 %%% | Design:
 %%% | - Keep the database in a protected ETS table, and let other processes
 %%% |   read directly from that table (at least in the common case).
-%%% | - Table is sorted and is structured by {IPClass, IP, PrefixLength} key;
-%%% |   this means that a single to a few ets:prev()-lookups suffice to
-%%% |   get to the relevant entry.
+%%% | - Table is sorted and is structured by {IPClass, Prefix, ...} key,
+%%% |   with extra entries as necessary to ensure that a single
+%%% |   ets:prev()-lookup always suffices to get to the relevant entry.
+%%% |   By putting all data in the key, we don't even need a separate
+%%% |   ets:lookup() call.
 %%% | - When data is being loaded, it is inserted into another table.
 %%% |   This table is then renamed, after which it is the master table.
 %%% |   The necessary precautions are taken to ensure that lookups still
@@ -160,8 +162,6 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 async_lookup_with_sync_fallback(Type, IP) when is_atom(Type), is_binary(IP) ->
     try do_lookup(Type,IP) of
-        {error, inconsistent} ->
-            sync_lookup(Type, IP);
         Result ->
             Result
     catch _:badarg -> % Table does not exist?
@@ -169,28 +169,21 @@ async_lookup_with_sync_fallback(Type, IP) when is_atom(Type), is_binary(IP) ->
     end.
 
 do_lookup(Type, IP) when is_atom(Type), is_bitstring(IP) ->
-    case ets:prev(?TABLE_NAME, {Type, IP, 1}) of
-        {Type, KeyPrefix, _Dummy}=Key ->
-            case ets:lookup(?TABLE_NAME, Key) of
-                []  ->
-                    Prefix=Origin=undefined;
-                [{Key, Origin}] ->
+    case ets:prev(?TABLE_NAME, {Type, IP, <<>>, <<>>}) of % bitstring > list
+        {Type, KeyPrefix, PrefixOpt, Origin} ->
+            case PrefixOpt of
+                []  ->                                % Regular entry
                     Prefix = KeyPrefix;
-                [{Key, Origin, Prefix}] ->      % Gap fill entry
+                [Prefix] when is_bitstring(Prefix) -> % Gap fill entry
                     ok
             end,
-            case Prefix of
-                undefined ->
-                    {error, inconsistent}; % Slightly unexpected, but can happen in the async case.
-                _ when is_bitstring(Prefix) ->
-                    case is_bitstring_prefix(Prefix,IP) of
-                        true ->
-                            %% Prefix matches!
-                            {ok, Origin};
-                        _ ->
-                            %% Prefix does not match: item is not in the database.
-                            {error, unknown}
-                    end
+            case is_bitstring_prefix(Prefix,IP) of
+                true ->
+                    %% Prefix matches!
+                    {ok, Origin};
+                false ->
+                    %% Prefix does not match: item is not in the database.
+                    {error, unknown}
             end;
         {_OtherClass, _, _} ->
             {error, unknown};
@@ -240,8 +233,8 @@ reload(DatabaseFiles, ServerPid, Token, ReplyTo) ->
     error_logger:info_msg("eripedb: reloading from files ~p", [DatabaseFiles]),
     try ets:new(?TEMP_TABLE_NAME, table_options()) of
         Table ->
-            Callback = fun(Key,Value,T) ->
-                               ets:insert(T, {Key,Value}),
+            Callback = fun({Class,Prefix},Value,T) ->
+                               ets:insert(T, {{Class, Prefix, [], Value}}),
                                T
                        end,
             lists:foreach(fun(DBF) ->
@@ -282,12 +275,15 @@ complete_table(Tab) ->
 %% Invariant 1: Prefixes in stack are nested.
 %% Invariant 2: All gaps before 'Last' have been filled.
 %% Invariant 3: 'Last' and 'Key' are neighbour keys (Last < Key).
+complete_table({_,_,Extra,_}=Key, Stack, Tab) when Extra /= [] ->
+    %% Fill entry - ignore this.
+    NextKey = ets:next(Tab, Key),
+    complete_table(NextKey, Stack, Tab);
 complete_table(Key, Stack, Tab) ->
     Stack2 = fill_table_gap(Key, Stack, Tab),
     case Key of
         '$end_of_table' -> ok;
-        _ ->
-            [{Key={Class,Prefix,_}, Origin}] = ets:lookup(Tab, Key),
+        {Class,Prefix,[],Origin} ->
             NextKey = ets:next(Tab, Key),
             complete_table(NextKey, [{Class,Prefix,Origin} | Stack2], Tab)
     end.
@@ -301,8 +297,8 @@ fill_table_gap(NextKey, [{Class, Prefix, _} | RestStack]=Stack, Tab) ->
     DoPop =
         case NextKey of
             '$end_of_table' -> true;
-            {NextClass, _NextPrefix, _} when NextClass /= Class -> true;
-            {_NextClass, NextPrefix, _} ->
+            {NextClass, _NextPrefix, _, _} when NextClass /= Class -> true;
+            {_NextClass, NextPrefix, _, _} ->
                 not is_bitstring_prefix(Prefix, NextPrefix)
         end,
     case DoPop of
@@ -318,8 +314,7 @@ fill_table_gap(NextKey, [{Class, Prefix, _} | RestStack]=Stack, Tab) ->
                     case FillFromPrefix > Prefix andalso % All-ones handling
                         is_bitstring_prefix(ParentPrefix, FillFromPrefix) of
                         true ->
-                            FillFromKey = {ParentClass, FillFromPrefix, 0},
-                            FillEntry = {FillFromKey, ParentOrigin, ParentPrefix},
+                            FillEntry = {{ParentClass, FillFromPrefix, [ParentPrefix], ParentOrigin}},
                             ets:insert(Tab, FillEntry);
                         false ->
                             ok                  % Nothing to fill, or fill with.

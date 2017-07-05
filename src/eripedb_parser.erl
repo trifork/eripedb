@@ -89,10 +89,10 @@ handle_line(<<"#", _/binary>>, SMState) ->
     SMState;
 handle_line(<<"route:", PrefixStr/binary>>, none) ->
     Prefix = parse_address_prefix4(PrefixStr),
-    {has_header, {ipv4, Prefix, 0}};
+    {has_header, {ipv4, Prefix}};
 handle_line(<<"route6:", PrefixStr/binary>>, none) ->
     Prefix = parse_address_prefix6(PrefixStr),
-    {has_header, {ipv6, Prefix, 0}};
+    {has_header, {ipv6, Prefix}};
 handle_line(<<"origin:", Origin0/binary>>, {has_header, Name}) ->
     Origin = trim_leading_spaces(Origin0),
     %% Report:
