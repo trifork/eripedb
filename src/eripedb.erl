@@ -170,24 +170,31 @@ async_lookup_with_sync_fallback(Type, IP) when is_atom(Type), is_binary(IP) ->
 
 do_lookup(Type, IP) when is_atom(Type), is_bitstring(IP) ->
     case ets:prev(?TABLE_NAME, {Type, IP, 1}) of
-        {Type, _, _}=Key ->
-            %% TODO: Add check that IP is in fact within the prefix!
+        {Type, KeyPrefix, _Dummy}=Key ->
             case ets:lookup(?TABLE_NAME, Key) of
-                [{{_Type, Prefix, _Dummy}, Origin}] ->
-                    PrefixLen = bit_size(Prefix),
-                    case IP of
-                        <<Prefix:PrefixLen/bitstring, _/bitstring>> ->
+                []  ->
+                    Prefix=Origin=undefined;
+                [{Key, Origin}] ->
+                    Prefix = KeyPrefix;
+                [{Key, Origin, Prefix}] ->      % Gap fill entry
+                    ok
+            end,
+            case Prefix of
+                undefined ->
+                    {error, inconsistent}; % Slightly unexpected, but can happen in the async case.
+                _ when is_bitstring(Prefix) ->
+                    case is_bitstring_prefix(Prefix,IP) of
+                        true ->
                             %% Prefix matches!
                             {ok, Origin};
                         _ ->
-                            %% Prefix does not match. Recurse, trying to hit parent:
-                            do_lookup(Type, longest_common_bitstring(IP, Prefix))
-                    end;
-                [] ->
-                    {error, inconsistent} % Slightly unexpected, but can happen in the async case.
+                            %% Prefix does not match: item is not in the database.
+                            {error, unknown}
+                    end
             end;
-        _ ->
-            %% Either '$end_of_table' or something of another class.
+        {_OtherClass, _, _} ->
+            {error, unknown};
+        '$end_of_table' ->
             {error, unknown}
     end.
 
@@ -252,6 +259,8 @@ reload(DatabaseFiles, ServerPid, Token, ReplyTo) ->
                          end,
                          DatabaseFiles),
             error_logger:info_msg("eripedb reload: done - entry_count=~p", [ets:info(Table,size)]),
+            complete_table(Table),
+            error_logger:info_msg("eripedb reload: Table gaps filled - entry_count=~p", [ets:info(Table,size)]),
             ets:give_away(Table, ServerPid, {ripe_table, Token, ReplyTo, DatabaseFiles})
     catch
         _:badarg ->
@@ -259,27 +268,74 @@ reload(DatabaseFiles, ServerPid, Token, ReplyTo) ->
             gen_server:reply(ReplyTo, {error, already_loading})
     end.
 
-longest_common_bitstring(A, B) ->
-    longest_common_bitstring_by_bytes(A, B, 0).
 
-longest_common_bitstring_by_bytes(A, B, Len) ->
-    LenP1 = Len+1,
-    case {A,B} of
-        {<<X:LenP1/binary, _/bitstring>>,
-         <<X:LenP1/binary, _/bitstring>>} ->
-            longest_common_bitstring_by_bytes(A, B, Len+1);
+%%% Complete table of {Prefix, Origin} with items of {FromKey, Origin, Prefix},
+%%% so that a single ets:prev() lookup suffices to answer ASN queries.
+%%% In the worst case, this doubles the table size.
+%%% A new entry is needed whenever two neighbour entries A,B does not
+%%% fulfill "A is prefix of B" or "A ends where B begins".
+
+complete_table(Tab) ->
+    complete_table(ets:first(Tab), [], Tab).
+
+%% Stack is a list of [{Prefix,Origin}], with nested prefixes, most specific first.
+%% Invariant 1: Prefixes in stack are nested.
+%% Invariant 2: All gaps before 'Last' have been filled.
+%% Invariant 3: 'Last' and 'Key' are neighbour keys (Last < Key).
+complete_table(Key, Stack, Tab) ->
+    Stack2 = fill_table_gap(Key, Stack, Tab),
+    case Key of
+        '$end_of_table' -> ok;
         _ ->
-            longest_common_bitstring_by_bits(A, B, 8*Len)
+            [{Key={Class,Prefix,_}, Origin}] = ets:lookup(Tab, Key),
+            NextKey = ets:next(Tab, Key),
+            complete_table(NextKey, [{Class,Prefix,Origin} | Stack2], Tab)
     end.
 
-longest_common_bitstring_by_bits(A, B, Len) ->
-    LenP1 = Len+1,
-    case {A,B} of
-        {<<X:LenP1/bitstring, _/bitstring>>,
-         <<X:LenP1/bitstring, _/bitstring>>} ->
-            longest_common_bitstring_by_bits(A, B, Len+1);
-        _ ->
-            <<Common:Len/bitstring, _/bitstring>> = A,
-            Common
+%% fill_table_gap(): Ensure that a) the stack is popped such that all
+%% its elements are prefixes of Key, with the same class; and b)
+%% fill-elements are added to the table for all popped elements, as necessary.
+fill_table_gap(_NextKey, [], _Tab) ->
+    [];
+fill_table_gap(NextKey, [{Class, Prefix, _} | RestStack]=Stack, Tab) ->
+    DoPop =
+        case NextKey of
+            '$end_of_table' -> true;
+            {NextClass, _NextPrefix, _} when NextClass /= Class -> true;
+            {_NextClass, NextPrefix, _} ->
+                not is_bitstring_prefix(Prefix, NextPrefix)
+        end,
+    case DoPop of
+        false ->
+            Stack;                              % Done popping.
+        true ->
+            %% Pop - and add table entry if necessary:
+            case RestStack of
+                [] ->
+                    ok;                       % Nothing to fill with.
+                [{ParentClass, ParentPrefix, ParentOrigin} | _] ->
+                    FillFromPrefix = first_after_prefix(Prefix),
+                    case FillFromPrefix > Prefix andalso % All-ones handling
+                        is_bitstring_prefix(ParentPrefix, FillFromPrefix) of
+                        true ->
+                            FillFromKey = {ParentClass, FillFromPrefix, 0},
+                            FillEntry = {FillFromKey, ParentOrigin, ParentPrefix},
+                            ets:insert(Tab, FillEntry);
+                        false ->
+                            ok                  % Nothing to fill, or fill with.
+                    end
+            end,
+            fill_table_gap(NextKey, RestStack, Tab)
     end.
 
+first_after_prefix(Key) ->
+    Bits = bit_size(Key),
+    <<X:Bits>> = Key,
+    <<(X+1):Bits>>.
+
+is_bitstring_prefix(A,B) ->
+    ALen = bit_size(A),
+    case B of
+        <<A:ALen/bitstring, _/bitstring>> -> true;
+        _ -> false
+    end.
