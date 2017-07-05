@@ -1,0 +1,5 @@
+route: 1.2.3.0/24
+origin: ALT24
+
+route: 1.0.0.0/8
+origin: ALT8
