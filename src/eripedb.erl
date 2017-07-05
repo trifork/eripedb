@@ -46,7 +46,7 @@ start_link() ->
 lookup(ipv4, {A,B,C,D}) ->
     async_lookup_with_sync_fallback(ipv4, <<A,B,C,D>>);
 lookup(ipv6, {A,B,C,D, E,F,G,H}) ->
-    async_lookup_with_sync_fallback(ipv6, <<A,B,C,D, E,F,G,H>>).
+    async_lookup_with_sync_fallback(ipv6, <<A:16,B:16,C:16,D:16, E:16,F:16,G:16,H:16>>).
 
 sync_lookup(Type, IP) when is_atom(Type), is_binary(IP) ->
     gen_server:call(?SERVER, {sync_lookup, Type, IP}).
@@ -185,7 +185,7 @@ do_lookup(Type, IP) when is_atom(Type), is_bitstring(IP) ->
                     %% Prefix does not match: item is not in the database.
                     {error, unknown}
             end;
-        {_OtherClass, _, _} ->
+        {_OtherClass, _, _, _} ->
             {error, unknown};
         '$end_of_table' ->
             {error, unknown}
@@ -312,10 +312,11 @@ fill_table_gap(NextKey, [{Class, Prefix, _} | RestStack]=Stack, Tab) ->
                 [{ParentClass, ParentPrefix, ParentOrigin} | _] ->
                     FillFromPrefix = first_after_prefix(Prefix),
                     case FillFromPrefix > Prefix andalso % All-ones handling
+                        (NextKey=='$end_of_table' orelse FillFromPrefix < element(2,NextKey)) andalso
                         is_bitstring_prefix(ParentPrefix, FillFromPrefix) of
                         true ->
                             FillEntry = {{ParentClass, FillFromPrefix, [ParentPrefix], ParentOrigin}},
-                            ets:insert(Tab, FillEntry);
+                            ets:insert_new(Tab, FillEntry);
                         false ->
                             ok                  % Nothing to fill, or fill with.
                     end

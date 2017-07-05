@@ -115,18 +115,26 @@ handle_line(Line, SMState) ->
     SMState.
 
 parse_address_prefix4(PrefixStr) ->
-    [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
-    {ok, {A,B,C,D}} = inet:parse_ipv4_address(binary_to_list(IPStr)),
-    Length = binary_to_integer(LengthStr),
-    <<Prefix:Length/bitstring, _/bitstring>> = <<A,B,C,D>>,
-    Prefix.
+    try
+        [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
+        {ok, {A,B,C,D}} = inet:parse_ipv4_address(binary_to_list(IPStr)),
+        Length = binary_to_integer(LengthStr),
+        <<Prefix:Length/bitstring, _/bitstring>> = <<A,B,C,D>>,
+        Prefix
+    catch _:Reason ->
+            error({bad_ipv4_prefix, PrefixStr, Reason, erlang:get_stacktrace()})
+    end.
 
 parse_address_prefix6(PrefixStr) ->
-    [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
-    {ok, {A,B,C,D,E,F,G,H}} = inet:parse_ipv6_address(binary_to_list(IPStr)),
-    Length = binary_to_integer(LengthStr),
-    <<Prefix:Length/bitstring, _/bitstring>> = <<A,B,C,D,E,F,G,H>>,
-    Prefix.
+    try
+        [IPStr,LengthStr] = binary:split(trim_leading_spaces(PrefixStr),<<"/">>),
+        {ok, {A,B,C,D,E,F,G,H}} = inet:parse_ipv6_address(binary_to_list(IPStr)),
+        Length = binary_to_integer(LengthStr),
+        <<Prefix:Length/bitstring, _/bitstring>> = <<A:16,B:16,C:16,D:16,E:16,F:16,G:16,H:16>>,
+        Prefix
+    catch _:Reason ->
+            error({bad_ipv6_prefix, PrefixStr, Reason, erlang:get_stacktrace()})
+    end.
 
 trim_leading_spaces(<<" ", Rest/binary>>) ->
     trim_leading_spaces(Rest);
