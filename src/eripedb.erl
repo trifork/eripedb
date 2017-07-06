@@ -23,7 +23,7 @@
 
 %% API
 -export([start_link/0,
-         lookup/2,
+         lookup/1, lookup/2,
          sync_lookup/2,
          reload/0,
          populated/0]).
@@ -42,6 +42,11 @@
 
 start_link() ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, {}, []).
+
+lookup(IP) when tuple_size(IP)==4 ->
+    lookup(ipv4, IP);
+lookup(IP) when tuple_size(IP)==8 ->
+    lookup(ipv6, IP).
 
 lookup(ipv4, {A,B,C,D}) ->
     async_lookup_with_sync_fallback(ipv4, <<A,B,C,D>>);
@@ -146,7 +151,7 @@ handle_info({'ETS-TRANSFER', Table, _FromPid, {ripe_table, Token, ReplyTo, NewDa
                        populated=true,
                        database_files=NewDatabaseFiles
                       },
-            Response = loaded;
+            Response = {ok, loaded};
         false ->
             error_logger:error_msg("eripedb: Received a table with the wrong token: ~p vs expected ~p",
                                    [Token, TableToken]),
@@ -323,7 +328,7 @@ fill_table_gap(NextKey, [{Class, Prefix, _} | RestStack]=Stack, Tab) ->
                 [{ParentClass, ParentPrefix, ParentOrigin} | _] ->
                     FillFromPrefix = first_after_prefix(Prefix),
                     case FillFromPrefix > Prefix andalso % All-ones handling
-                        (NextKey=='$end_of_table' orelse FillFromPrefix < element(2,NextKey)) andalso
+                        (NextKey=='$end_of_table' orelse {ParentClass,FillFromPrefix} < {element(1,NextKey), element(2,NextKey)}) andalso
                         is_bitstring_prefix(ParentPrefix, FillFromPrefix) of
                         true ->
                             FillEntry = {{ParentClass, FillFromPrefix, [ParentPrefix], ParentOrigin}},

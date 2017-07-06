@@ -4,6 +4,7 @@
 
 %%% Assume that test data files are in test/data/
 
+-define(TEMP_FILE, "test.tmp").
 
 test_data_fixture(Filename, Fun) ->
     {setup,
@@ -14,6 +15,22 @@ test_data_fixture(Filename, Fun) ->
              application:start(eripedb)
      end,
      fun(_) ->
+             application:stop(eripedb)
+     end,
+     Fun}.
+
+temp_data_fixture(Fun) ->
+    {setup,
+     fun() ->
+             ok = file:write_file(?TEMP_FILE, <<>>),
+             application:start(sasl),
+             application:load(eripedb),
+             application:set_env(eripedb, database_files, [?TEMP_FILE]),
+             application:start(eripedb),
+             wait_for(fun() -> eripedb:populated() end, 1000)
+     end,
+     fun(_) ->
+             %file:delete(?TEMP_FILE),
              application:stop(eripedb)
      end,
      Fun}.
@@ -137,6 +154,140 @@ lookup_speed_test_() ->
                               io:format(user, "Lookup speed: ~.3fus/call; ~.1f calls/s\n", [Time/Calls, Calls/(Time/1.0e6)])
                       end).
 
+random_test_() ->
+    temp_data_fixture(
+      {timeout, 60000,
+       fun() ->
+               Sizes = lists:seq(1,32),
+               lists:foreach(fun(Size) ->
+                                     Iterations = max(5, min(100, Size)),
+                                     io:format(user, "Random tests of size ~b...\n", [Size]),
+                                     lists:foreach(fun(_) ->
+                                                           random_test_with_size(Size)
+                                                   end,
+                                                   lists:seq(1,Iterations))
+                             end, Sizes)
+       end
+     }).
+
+random_test_with_size(Size) ->
+    Entries = random_entries(Size),
+    io:format("DB| Running test (size ~p) with entries: ~p\n", [Size,Entries]),
+    ok = file:write_file(?TEMP_FILE, format_ripedb_file(Entries)),
+    {ok, loaded} = eripedb:reload(),
+    QueryIPs = lists:map(fun(_) -> random_ip() end, lists:seq(1, max(Size,100))),
+    %% io:format("DB| Querying with: ~p\n", [QueryIPs]),
+    lists:foreach(fun(IP) ->
+                          query_and_check(IP, Entries)
+                  end,
+                  QueryIPs).
+
+query_and_check({Class,IP}, Entries) ->
+    IPTuple = case byte_size(IP) of
+                  4 -> ipv4_to_tuple(IP);
+                  16 -> ipv6_to_tuple(IP)
+              end,
+    ActualResult = eripedb:lookup(Class, IPTuple),
+    ExpectedResult = expected_result(Class, IP, Entries),
+    ?assertEqual({ExpectedResult, IPTuple}, {ActualResult, IPTuple}).
+
+expected_result(Class, IP, Entries) ->
+    %% TODO: Model ipv4 embedding.
+    Matching = [{Entry, -bit_size(Prefix)}
+                || Entry={{C, Prefix}, Value} <- Entries,
+                   C==Class,
+                   is_bitstring_prefix(Prefix, IP)],
+    case lists:keysort(2, Matching) of
+        [] ->
+            {error, unknown};
+        [{{_,Value},_NegLen} | _] ->
+            {ok, Value}
+    end.
+
+
+random_entries(Size) ->
+    NEntries = random:uniform(2*Size),
+    CPrefixes = [random_prefix(Size) || _ <- lists:seq(1,NEntries)],
+    case length(CPrefixes) == length(lists:usort(CPrefixes)) of
+        false ->
+            % Collisions - retry:
+            random_entries(Size);
+        true ->
+            [{CPrefix, random_name()} || CPrefix <- CPrefixes]
+    end.
+
+random_name() ->
+    String = [($A + random:uniform(26)-1) || _ <- lists:seq(1,1+random:uniform(10))],
+    list_to_binary(String).
+
+random_ip() ->
+    {Class,NBytes} = case random:uniform(2) of
+              1 -> {ipv4,4};
+              2 -> {ipv6,16}
+            end,
+    {Class, random_binary(NBytes)}.
+
+random_binary(NBytes) ->
+    NBits = 8*NBytes,
+    case random:uniform(3) of
+        1 ->
+            %% Totally random.
+            crypto:rand_bytes(NBytes);
+        2 ->
+            %% One bit set or unset.
+            Base = random:uniform(2)-2, % 0 or -1.
+            SingleBit = 1 bsl (random:uniform(8*NBytes)-1),
+            <<(Base bxor SingleBit):NBits>>;
+        3 ->
+            %% Simple combinations.
+            case random:uniform(4) of
+                1 -> % Inversion.
+                    <<X:NBits>> = random_binary(NBytes),
+                    <<(X bxor -1):NBits>>;
+                2 -> % AND.
+                    <<X:NBits>> = random_binary(NBytes),
+                    <<Y:NBits>> = random_binary(NBytes),
+                    <<(X band Y):NBits>>;
+                3 -> % OR.
+                    <<X:NBits>> = random_binary(NBytes),
+                    <<Y:NBits>> = random_binary(NBytes),
+                    <<(X bor Y):NBits>>;
+                4 -> % XOR - why not
+                    <<X:NBits>> = random_binary(NBytes),
+                    <<Y:NBits>> = random_binary(NBytes),
+                    <<(X bor Y):NBits>>
+            end
+    end.
+
+random_prefix(Size) ->
+    {Class, IP} = random_ip(),
+    MaxBits = if Size>20 -> bit_size(IP);
+                 true -> min(bit_size(IP), Size)
+              end,
+    PrefixLength = random:uniform(MaxBits+1)-1,
+    <<Prefix:PrefixLength/bitstring, _/bitstring>> = IP,
+    {Class, Prefix}.
+
+format_ripedb_file(Entries) ->
+    unicode:characters_to_binary([format_ripedb_entry(E) || E <- Entries]).
+
+format_ripedb_entry({{Class, Prefix}, Origin}) ->
+    [case Class of
+         ipv4 -> ["route: ", format_ipv4_prefix(Prefix)];
+         ipv6 -> ["route6: ", format_ipv6_prefix(Prefix)]
+     end,
+     "\n",
+     "origin: ", Origin, "\n",
+     "\n"
+    ].
+
+format_ipv4_prefix(Prefix) ->
+    [inet_parse:ntoa(ipv4_to_tuple(pad_to_length(32, Prefix))),
+     "/", integer_to_list(bit_size(Prefix))].
+
+format_ipv6_prefix(Prefix) ->
+    [inet_parse:ntoa(ipv6_to_tuple(pad_to_length(128, Prefix))),
+     "/", integer_to_list(bit_size(Prefix))].
 
 %%%========== Utility: ========================================
 
@@ -147,9 +298,9 @@ set_filename(Filename) ->
 wait_for(Fun, TimeoutMillis) ->
     T0 = erlang:monotonic_time(1000),
     Deadline = T0 + TimeoutMillis,
-    wait_until(Fun, Deadline).
+    wait_until(Fun, Deadline, 100).
 
-wait_until(Fun, Deadline) ->
+wait_until(Fun, Deadline, YieldsLeft) ->
     case Fun() of
         true ->
             ok;
@@ -159,7 +310,23 @@ wait_until(Fun, Deadline) ->
                 true ->
                     error(timeout);
                 false ->
-                    timer:sleep(2),
-                    wait_until(Fun, Deadline)
+                    if YieldsLeft>0 -> erlang:yield();
+                       true -> timer:sleep(1)
+                    end,
+                    wait_until(Fun, Deadline, YieldsLeft-1)
             end
     end.
+
+is_bitstring_prefix(A,B) when is_bitstring(A), is_bitstring(B) ->
+    ALen = bit_size(A),
+    case B of
+        <<A:ALen/bitstring, _/bitstring>> -> true;
+        _ -> false
+    end.
+
+ipv4_to_tuple(<<A,B,C,D>>) -> {A,B,C,D}.
+ipv6_to_tuple(<<A:16,B:16,C:16,D:16, E:16,F:16,G:16,H:16>>) -> {A,B,C,D,E,F,G,H}.
+
+pad_to_length(L, Bitstring) ->
+    PadSize = L - bit_size(Bitstring),
+    <<Bitstring/bitstring, 0:PadSize>>.
