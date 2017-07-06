@@ -45,8 +45,19 @@ start_link() ->
 
 lookup(ipv4, {A,B,C,D}) ->
     async_lookup_with_sync_fallback(ipv4, <<A,B,C,D>>);
-lookup(ipv6, {A,B,C,D, E,F,G,H}) ->
-    async_lookup_with_sync_fallback(ipv6, <<A:16,B:16,C:16,D:16, E:16,F:16,G:16,H:16>>).
+lookup(ipv6, {A,B,C,D, E,F,G,H}=IP) ->
+    case async_lookup_with_sync_fallback(ipv6, <<A:16,B:16,C:16,D:16, E:16,F:16,G:16,H:16>>) of
+        {ok,_}=Result ->
+            Result;
+        {error,unknown}=IPv6Result ->
+            case IP of
+                {0,0,0,0,0,65535,X,Y} ->
+                    %% Embedded IPv4 address. Look up in IPv4 database:
+                    async_lookup_with_sync_fallback(ipv4, <<X:16, Y:16>>);
+                _ ->
+                    IPv6Result
+            end
+    end.
 
 sync_lookup(Type, IP) when is_atom(Type), is_binary(IP) ->
     gen_server:call(?SERVER, {sync_lookup, Type, IP}).

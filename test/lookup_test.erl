@@ -75,6 +75,17 @@ simple_lookup_test_() ->
                               ok
                       end).
 
+ipv6_to_ipv4_fallback_test_() ->
+    test_data_fixture("ipv4.db",
+                      fun() ->
+                              wait_for(fun() -> eripedb:populated() end, 1000),
+
+                              ?assertEqual({ok, <<"SUB24">>},
+                                           eripedb:lookup(ipv6, {0,0,0,0,0,65535,16#102,16#304})),
+                              ok
+                      end).
+
+
 reload_gap_test_() ->
     test_data_fixture("ipv4.db",
                       fun() ->
