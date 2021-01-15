@@ -21,7 +21,7 @@
           newline_cp :: binary:cp()
          }).
 
--spec read/3 :: (iodata(), object_callback(FoldState), FoldState) -> {ok,FoldState} | {error,_}.
+-spec read(iodata(), object_callback(FoldState), FoldState) -> {ok,FoldState} | {error,_}.
 read(FileName, ObjectCallbackFun, FoldState) when is_function(ObjectCallbackFun, 3) ->
     case file:open(FileName, [binary, read, compressed]) of
         {error,_}=Err ->
